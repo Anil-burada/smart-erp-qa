@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "project_id": "mock_erp",
+  "name": "demo_indent_to_grn",
+  "description": "Fully local harmless demo; user accounts are fake test names in .env, not ERP credentials",
+  "logout_workflow": "mock_logout",
+  "stages": [
+    {
+      "name": "Create Purchase Indent",
+      "workflow": "mock_pi_create",
+      "account": "creator",
+      "phase": "create",
+      "require_assertion": true
+    },
+    {
+      "name": "Manager approves Indent",
+      "workflow": "mock_pi_approve",
+      "account": "manager",
+      "phase": "approval",
+      "require_assertion": true
+    },
+    {
+      "name": "Create Local PO",
+      "workflow": "mock_lpo_create",
+      "account": "buyer",
+      "phase": "create",
+      "require_assertion": true
+    },
+    {
+      "name": "GM approves PO",
+      "workflow": "mock_lpo_approve",
+      "account": "gm",
+      "phase": "approval",
+      "require_assertion": true
+    },
+    {
+      "name": "Create Goods Receipt Note",
+      "workflow": "mock_grn_create",
+      "account": "warehouse",
+      "phase": "grn",
+      "require_assertion": true
+    }
+  ]
+}

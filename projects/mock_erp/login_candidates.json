@@ -1,0 +1,19 @@
+{
+  "project_id": "mock_erp",
+  "project_url": "http://127.0.0.1:8766/mock",
+  "note": "Locator suggestions only. Supply and verify a unique post-login success selector before login.json.",
+  "candidates": {
+    "username": {
+      "kind": "css",
+      "value": "#username"
+    },
+    "password": {
+      "kind": "css",
+      "value": "#password"
+    },
+    "submit": {
+      "kind": "css",
+      "value": "#loginBtn"
+    }
+  }
+}

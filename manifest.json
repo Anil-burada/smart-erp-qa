@@ -1,0 +1,13 @@
+{
+  "version": "SMART_ERP_LIVE_VIEW_V1",
+  "restored": false,
+  "originals": [
+    "backend/api.py",
+    "backend/script_runtime.py",
+    "frontend/index.html"
+  ],
+  "added": [
+    "backend/live_preview.py",
+    "frontend/live-preview.js"
+  ]
+}

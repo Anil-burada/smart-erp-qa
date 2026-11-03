@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#102744">
+  <meta name="description" content="Smart ERP QA Control Center local automation dashboard">
+  <title>Smart ERP QA | Leocem Automation Dashboard</title>
+  <link rel="stylesheet" href="/assets/styles.css?v=6360">
+  <link rel="stylesheet" href="/assets/reporting.css?v=6360">
+  <script src="/assets/module-suite.js?v=6360" defer></script>
+  <script src="/assets/workspace.js?v=636toggles2" defer></script>
+  <script src="/assets/optional_ai_lab.js?v=636AILAB01" defer></script>
+  <link rel="stylesheet" href="/assets/optional_ai_lab.css?v=636AILAB01">
+  <script src="/assets/app.js?v=6360" defer></script>
+  <script src="/assets/reporting.js?v=6360" defer></script>
+  <script src="/assets/v636_cases.js?v=636toggles2" defer></script>
+  <link rel="stylesheet" href="/assets/v636_cases.css?v=636toggles2">
+  <link rel="stylesheet" href="/assets/module-suite.css?v=6360">
+<link rel="stylesheet" href="/assets/navy.css?v=636toggles2">
+  <script src="/assets/enhancements.js?v=6360" defer></script>
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar" id="sidebar" aria-label="Main navigation">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">S</span>
+        <div class="brand-copy">
+          <strong>SMART ERP <span>QA</span></strong>
+          <small>AUTOMATION WORKSPACE</small>
+        </div>
+      </div>
+      <div class="side-label">WORKSPACE</div>
+      <nav class="navigation" aria-label="Pages">
+        <button class="nav-item active" data-page="overview"><span class="nav-icon" aria-hidden="true">01</span> Dashboard</button>
+        <button class="nav-item" data-page="scripts"><span class="nav-icon" aria-hidden="true">02</span> Script Workspace</button>
+        <button class="nav-item" data-page="suite"><span class="nav-icon" aria-hidden="true">03</span> Test Case Report</button>
+        <button class="nav-item" data-page="reports"><span class="nav-icon" aria-hidden="true">04</span> Test Reports</button>
+        <button class="nav-item" data-page="ailab"><span class="nav-icon" aria-hidden="true">05</span> AI Test Lab <small style="font-size:10px">Optional</small></button>
+      </nav>
+      <div class="side-divider"></div>
+      <div class="sidebar-footer">
+        <div class="preview-note"><span class="pulse"></span> Local testing workspace</div>
+        <p>Python Playwright controls a browser on this computer.</p>
+      </div>
+    </aside>
+    <div id="sidebarOverlay" class="sidebar-overlay" hidden></div>
+    <main class="main-area">
+      <header class="topbar">
+        <div class="top-left">
+          <button class="menu-toggle" id="menuToggle" aria-label="Toggle navigation">&#9776;</button>
+          <div class="breadcrumb">SMART ERP QA <span>/</span> <strong id="breadcrumb">Dashboard</strong></div>
+        </div>
+        <div class="top-right">
+          <span class="environment-badge"><span class="tiny-dot"></span> <span id="modeName">Local Playwright</span></span>
+          <span id="globalRecordingStatus" class="recording-indicator" role="status">NO ERP SESSION</span>
+          <span class="avatar" aria-label="Local workspace">QA</span>
+        </div>
+      </header>
+      <div class="content-wrap" id="content" aria-live="polite"></div>
+      <footer class="main-footer">Smart ERP QA &middot; Edit. Review. Run. Verify. <span id="footerMode">FastAPI + SQLite + Playwright</span></footer>
+    </main>
+  </div>
+  <div class="evidence-backdrop" id="evidenceOverlay" hidden role="dialog" aria-modal="true" aria-labelledby="evidenceHeading">
+    <div class="evidence-dialog"><div class="evidence-toolbar"><strong id="evidenceHeading">Captured evidence</strong>
+    <a class="btn btn-white" id="evidenceDownload" download>Download</a><a class="btn btn-hero-outline" id="evidenceFullSize" target="_blank" rel="noopener">Open full size</a><button class="btn btn-hero-outline" id="evidenceClose" data-evidence-close>Close</button></div><div class="evidence-viewer" id="evidenceViewer"></div></div></div>
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+</body>
+</html>
+
+<!-- SMART_ERP_OPTIONAL_AI_LAB_V636_20261029 -->

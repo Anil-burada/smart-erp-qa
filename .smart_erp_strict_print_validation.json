@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "target": "working_scripts/procurement/pi_lpo_grn.py",
+  "backup": ".print_validation_backups/20261030_183938_ca2697/pi_lpo_grn.py",
+  "original_sha256": "263dae925ed52514cafa52af3c569935b56134ef0a4e30f44915b2a42a89f782",
+  "installed_sha256": "a4611872cc553748f8c32c8e8793c5fbb5a4ef477693f5d89914c2879dbe58e2"
+}

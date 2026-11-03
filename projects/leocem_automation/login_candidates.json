@@ -1,0 +1,20 @@
+{
+  "project_id": "leocem_automation",
+  "project_url": "https://ba.kagamierp.com/leocem",
+  "note": "Locator suggestions only. Supply and verify a unique post-login success selector before login.json.",
+  "candidates": {
+    "username": {
+      "kind": "css",
+      "value": "#username"
+    },
+    "password": {
+      "kind": "css",
+      "value": "#password"
+    },
+    "submit": {
+      "kind": "role",
+      "role": "link",
+      "name": "LOGIN"
+    }
+  }
+}

@@ -1,0 +1,34 @@
+name: smart-erp-qa
+services:
+  smart-erp:
+    build: .
+    init: true
+    ipc: host
+    ports:
+      - '127.0.0.1:8766:8766'
+    volumes:
+      # A localhost-only dashboard and interactive headless Playwright browser.
+      # Real data, workflows, screenshots and reports remain in this folder.
+      - './data:/workspace/data'
+      - './projects:/workspace/projects'
+      - './workflows:/workspace/workflows'
+      - './approval_plans:/workspace/approval_plans'
+      - './artifacts:/workspace/artifacts'
+      - './reports:/workspace/reports'
+      - './uploaded_scripts:/workspace/uploaded_scripts'
+      - './working_scripts:/workspace/working_scripts'
+      - './.env:/workspace/.env:ro'
+    environment:
+      ERPQA_HEADLESS: '1'
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      SMART_ERP_OPENAI_MODEL: ${SMART_ERP_OPENAI_MODEL:-gpt-4o-mini}
+      SMART_ERP_OLLAMA_MODEL: ${SMART_ERP_OLLAMA_MODEL:-llama3.2}
+      SMART_ERP_OLLAMA_URL: 'http://host.docker.internal:11434/api/generate'
+    extra_hosts:
+      - 'host.docker.internal:host-gateway'
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8766/api/health',timeout=5)"]
+      interval: 30s
+      timeout: 8s
+      retries: 3

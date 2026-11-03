@@ -1,0 +1,14 @@
+{
+  "name": "smart-erp-qa-desktop",
+  "version": "6.2.2-beta.1",
+  "private": true,
+  "description": "Smart ERP QA desktop with native WebContentsView and Playwright CDP bridge",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "lint": "node --check main.js && node --check preload.js && node --check toolbar.js"
+  },
+  "devDependencies": {
+    "electron": "45.0.0"
+  }
+}

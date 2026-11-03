@@ -1,0 +1,10 @@
+.venv/
+.env
+__pycache__/
+.pytest_cache/
+.git/
+*.pyc
+artifacts/
+reports/
+data/*.sqlite3
+uploaded_scripts/

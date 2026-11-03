@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "project_id": "erp_three",
+  "name": "indent_to_grn",
+  "description": "ILLUSTRATIVE third ERP: HOD for indent, Finance/Director for purchase order.",
+  "logout_workflow": "logout",
+  "stages": [
+    {"name":"Create indent","phase":"create","workflow":"create_indent","account":"requestor","require_assertion":true},
+    {"name":"HOD indent approval","phase":"approval","workflow":"approve_hod","account":"hod","require_assertion":true},
+    {"name":"Create PO","phase":"create","workflow":"create_po","account":"buyer","require_assertion":true},
+    {"name":"Finance PO approval","phase":"approval","workflow":"approve_finance","account":"finance","require_assertion":true},
+    {"name":"Director PO approval","phase":"approval","workflow":"approve_director","account":"director","require_assertion":true},
+    {"name":"Create GRN","phase":"grn","workflow":"create_grn","account":"warehouse","require_assertion":true}
+  ]
+}

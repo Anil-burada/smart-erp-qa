@@ -1,0 +1,1660 @@
+"""Local-only API serving the existing green/white UI and a real Playwright worker."""
+import json
+import os
+import shutil
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlsplit
+
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, PlainTextResponse, Response
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field, SecretStr
+from backend.browser import BrowserController
+from backend.approval_plans import (ApprovalPlan, save_plan, load_plan, list_plans, preview_plan,
+                                    executable_specs, local_accounts)
+from backend.python_export import generate_python
+from backend.pom_bundle import create_bundle
+from backend.locator import Workflow, LocatorSpec
+from backend.registry import BASE, connect, get_project, init_db, list_projects, save_project, workflow_path, Project, WORKFLOW_PATTERN
+from backend.json_workflow import (LocatorLibrary, atomic_json, convert_recording, read_library, save_library, fingerprint, resolve_locators)
+from backend.auth_config import LoginConfig, load_login_config, save_login_config, login_template, login_path
+from backend.ai_assistant import safe_summary, diagnose_local
+from backend.negative_cases import generate_candidates
+from backend.workflow_manage import archive_saved_workflow
+from backend.session_replay import planned_existing_session_workflow
+
+init_db()
+app = FastAPI(title='Smart ERP QA - Local Backend', docs_url='/api/docs')
+controller = BrowserController()
+from backend.script_workspace import ScriptManager
+script_manager = ScriptManager()
+FRONTEND = BASE / 'frontend'
+app.mount('/assets', StaticFiles(directory=str(FRONTEND)), name='assets')
+
+
+@app.on_event('shutdown')
+def stop_browser_worker():
+    # Prevent orphaned Playwright Node drivers when the server shuts down.
+    script_manager.stop()
+    controller.shutdown()
+
+
+@app.middleware('http')
+async def local_only(request: Request, call_next):
+    # SMART_ERP_PROTECTED_REMOTE_HOST_V636_20261029:
+    # This is opt-in and intended ONLY behind Cloudflare email-protected Tunnel.
+    host = (request.headers.get('host') or '').lower().split(':')[0]
+    origin = request.headers.get('origin')
+    local_host = host in ('127.0.0.1', 'localhost')
+    remote_host = (os.environ.get('SMART_ERP_ALLOWED_REMOTE_HOST') or '').strip().lower()
+    remote_enabled = os.environ.get('SMART_ERP_ENABLE_PROTECTED_REMOTE') == '1'
+    remote_host_valid = bool(remote_host) and remote_host.endswith('.trycloudflare.com') and remote_host.count('.') >= 2
+    remote_request = bool(remote_enabled and remote_host_valid and host == remote_host)
+    # Origin is still loopback-only. A localhost tunnel connector can reach it;
+    # we do not open the web server on the machine's network interfaces.
+    client_host = request.client.host if request.client else None
+    if remote_request and client_host not in ('127.0.0.1', '::1'):
+        return JSONResponse({'detail': 'Remote connector must be local'}, status_code=403)
+    if not local_host and not remote_request:
+        return JSONResponse({'detail': 'Localhost only'}, status_code=403)
+    if origin:
+        parsed = urlsplit(origin)
+        local_origin = parsed.scheme == 'http' and parsed.hostname in ('127.0.0.1', 'localhost') and parsed.port == 8766
+        remote_origin = remote_request and parsed.scheme == 'https' and parsed.hostname == remote_host and parsed.port is None
+        if not local_origin and not remote_origin:
+            return JSONResponse({'detail': 'Cross-origin request denied'}, status_code=403)
+    # Keep one owner of the managed page while a trusted script is executing.
+    # Read-only status/evidence APIs remain usable. Stop is always available.
+    if script_manager.busy and request.method not in ('GET', 'HEAD', 'OPTIONS'):
+        if not request.url.path.startswith('/api/script-workspace/'):
+            return JSONResponse({'detail': 'Script is running. Stop it before modifying the workspace or browser.'}, status_code=409)
+    return await call_next(request)
+
+
+@app.get('/')
+def homepage():
+    return FileResponse(FRONTEND / 'index.html')
+
+
+@app.get('/styles.css')
+def css():
+    return FileResponse(FRONTEND / 'styles.css', media_type='text/css')
+
+
+@app.get('/app.js')
+def js():
+    return FileResponse(FRONTEND / 'app.js', media_type='text/javascript')
+
+
+def fail(err: Exception):
+    if isinstance(err, ValueError):
+        raise HTTPException(400, str(err)) from err
+    if isinstance(err, TimeoutError):
+        raise HTTPException(504, str(err)) from err
+    # User-visible error text is truncated and never includes login data.
+    raise HTTPException(500, f'{type(err).__name__}: {str(err)[:500]}') from err
+
+
+@app.get('/api/health')
+def health():
+    return {'ok': True, 'mode': 'LOCAL_PLAYWRIGHT', 'desktop_enabled': os.environ.get('SMART_ERP_DESKTOP') == '1', 'note':'Approved test/staging only. Business assertions run only when explicitly configured; optional AI suggestions are not executable'}
+
+
+@app.get('/api/projects')
+def projects():
+    return list_projects()
+
+
+@app.post('/api/projects')
+def register(project: Project):
+    try:
+        return save_project(project)
+    except Exception as err:
+        fail(err)
+
+
+@app.delete('/api/projects/{project_id}')
+def delete_project(project_id: str):
+    if not get_project(project_id):
+        raise HTTPException(404, 'Project not found')
+    try:
+        session = controller.call('status')
+        if session.get('project_id') == project_id:
+            raise ValueError('Close the browser before deleting this project')
+        with connect() as c:
+            if c.execute('SELECT COUNT(*) FROM workflows WHERE project_id=?',(project_id,)).fetchone()[0]:
+                raise ValueError('Project contains workflows. Export or remove workflows before deleting')
+            c.execute('DELETE FROM projects WHERE id=?',(project_id,))
+        return {'deleted':project_id}
+    except Exception as err:
+        fail(err)
+
+
+class OpenInput(BaseModel):
+    project_id: str
+    embedded: bool = False
+
+
+@app.post('/api/browser/open')
+def browser_open(data: OpenInput):
+    project = get_project(data.project_id)
+    if not project:
+        raise HTTPException(404, 'Project not found')
+    try:
+        return controller.call('open', project=project, embedded=data.embedded)
+    except Exception as err:
+        fail(err)
+
+
+class ElectronAttachInput(BaseModel):
+    project_id: str
+    cdp_port: int = Field(ge=1024, le=65535)
+
+
+@app.post('/api/browser/electron/attach')
+def electron_attach(data: ElectronAttachInput):
+    # This endpoint is enabled only for the backend launched by our desktop
+    # app. It cannot be used by an ordinary web dashboard server.
+    if os.environ.get('SMART_ERP_DESKTOP') != '1':
+        raise HTTPException(403, 'Start the Windows desktop launcher first')
+    project = get_project(data.project_id)
+    if not project:
+        raise HTTPException(404, 'Project not found')
+    try:
+        return controller.call('attach_electron', project=project, cdp_port=data.cdp_port)
+    except Exception as err:
+        fail(err)
+
+
+class EmbeddedInput(BaseModel):
+    kind: str
+    x: int | None = Field(default=None, ge=0, le=2400)
+    y: int | None = Field(default=None, ge=0, le=1600)
+    text: str | None = Field(default=None, max_length=2048)
+    key: str | None = Field(default=None, max_length=40)
+    delta_y: int | None = Field(default=None, ge=-1600, le=1600)
+
+
+@app.get('/api/browser/embedded/frame')
+def embedded_frame():
+    try:
+        image = controller.call('embedded_frame')
+        return Response(content=image, media_type='image/jpeg', headers={
+            'Cache-Control':'no-store, private', 'Pragma':'no-cache',
+            'X-Content-Type-Options':'nosniff'})
+    except Exception as err:
+        fail(err)
+
+
+@app.post('/api/browser/embedded/action')
+def embedded_action(data: EmbeddedInput):
+    try:
+        return controller.call('embedded_action', **data.model_dump())
+    except Exception as err:
+        fail(err)
+
+
+@app.get('/api/browser/login-candidates')
+def browser_login_candidates():
+    """Return only selectors captured from the login page, never credentials."""
+    try:
+        return controller.call('login_candidates')
+    except Exception as err:
+        fail(err)
+
+
+def _verify_login_wizard_project(project_id: str):
+    project = get_project(project_id)
+    if not project:
+        raise HTTPException(404, 'ERP project not found')
+    if project['environment'] not in ('test','staging'):
+        raise HTTPException(403, 'Login automation configuration is TEST/STAGING only')
+    session = controller.call('status')
+    if not session.get('open') or session.get('project_id') != project_id:
+        raise HTTPException(400, 'Open the matching ERP in Browser Session first')
+    return project
+
+
+@app.post('/api/projects/{project_id}/login-setup/capture')
+def wizard_capture_login(project_id: str):
+    _verify_login_wizard_project(project_id)
+    try:
+        return controller.call('login_setup_capture')
+    except Exception as err:
+        fail(err)
+
+
+@app.get('/api/projects/{project_id}/login-setup/success-options')
+def wizard_success_options(project_id: str):
+    _verify_login_wizard_project(project_id)
+    try:
+        return controller.call('login_setup_success_options')
+    except Exception as err:
+        fail(err)
+
+
+class LoginSetupChoice(BaseModel):
+    index: int = Field(ge=0, le=19)
+
+
+@app.post('/api/projects/{project_id}/login-setup/save')
+def wizard_save_login(project_id: str, choice: LoginSetupChoice):
+    project = _verify_login_wizard_project(project_id)
+    try:
+        fields = controller.call('login_setup_finish', choice_index=choice.index)
+        config = LoginConfig(schema_version=1, project_id=project_id,
+                             project_url=project['url'], **fields)
+        previous = login_path(project_id)
+        if previous.exists():
+            backup = previous.with_name('login.before_wizard_' + datetime.now().strftime('%Y%m%d_%H%M%S_%f') + '.json')
+            shutil.copy2(previous, backup)
+        save_login_config(project_id, config)
+        return {'configured':True, 'project_id':project_id,
+                'message':'Login selectors saved (no password). Automatic authentication will be verified when you run the approved workflow.',
+                'selectors':config.model_dump(exclude={'schema_version','project_url','project_id'})}
+    except Exception as err:
+        fail(err)
+
+
+@app.get('/api/projects/{project_id}/login-config')
+def get_login_config(project_id: str):
+    if not get_project(project_id):
+        raise HTTPException(404, 'Project not found')
+    try:
+        return load_login_config(project_id).model_dump()
+    except ValueError as err:
+        if 'Configure login locators' in str(err):
+            return login_template(project_id)
+        fail(err)
+
+
+@app.get('/api/projects/{project_id}/login-ready')
+def login_ready(project_id: str):
+    """No credentials or selectors returned; distinguish saved configuration from verified login."""
+    if not get_project(project_id):
+        raise HTTPException(404, 'Project not found')
+    config_exists = login_path(project_id).exists()
+    if not config_exists:
+        return {'project_id': project_id, 'configured': False, 'verified': False,
+                'message': 'Login selectors are not saved yet. Configure and test the username, password, submit and success selectors in Browser Session.'}
+    try:
+        load_login_config(project_id)
+    except Exception:
+        return {'project_id': project_id, 'configured': False, 'verified': False,
+                'message': 'Saved login selectors are invalid or the ERP URL changed. Review login.json in Browser Session.'}
+    return {'project_id': project_id, 'configured': True, 'verified': False,
+            'message': 'Login selectors saved. Login is verified only after the runtime login succeeds; credentials are never stored.'}
+
+
+@app.put('/api/projects/{project_id}/login-config')
+def put_login_config(project_id: str, config: LoginConfig):
+    try:
+        return save_login_config(project_id, config)
+    except Exception as err:
+        fail(err)
+
+
+class RuntimeLoginInput(BaseModel):
+    project_id: str
+    username: str = Field(min_length=1, max_length=200)
+    password: SecretStr
+
+
+@app.post('/api/projects/{project_id}/login-config/test')
+def test_login_config(project_id: str):
+    """Check 3 pre-login locator matches; password is never read or returned."""
+    config = load_login_config(project_id)
+    if controller.call('status').get('project_id') != project_id:
+        raise HTTPException(400, 'Open the matching ERP on its login screen first')
+    result = {}
+    for field in ('username', 'password', 'submit'):
+        try:
+            info = controller.call('test_locator', spec=getattr(config,field).model_dump(exclude_none=True))
+            result[field] = {'count':info['count'], 'visible':info['visible']}
+        except Exception:
+            result[field] = {'count':0,'visible':False}
+    return {'uniquely_visible':all(x['count']==1 and x['visible'] for x in result.values()),'fields':result,
+            'note':'The success locator is checked only after login. Business authorization still requires verification.'}
+
+
+@app.post('/api/browser/login')
+def browser_login(data: RuntimeLoginInput):
+    try:
+        config = load_login_config(data.project_id)
+        status = controller.call('status')
+        if status.get('project_id') != data.project_id:
+            raise ValueError('Open the registered ERP browser before logging in')
+        return controller.call(
+            'login', config=config.model_dump(exclude={'project_id','project_url','schema_version'}),
+            username=data.username, password=data.password.get_secret_value()
+        )
+    except Exception as err:
+        # No password is ever included in error text.
+        fail(err)
+
+
+@app.get('/api/browser/status')
+def browser_status():
+    try:
+        return controller.call('status')
+    except Exception as err:
+        fail(err)
+
+
+@app.get('/api/browser/dom-inspector')
+def browser_dom_inspector():
+    """Get redacted IDs and controls on the live ERP screen; no clicks."""
+    try:
+        return controller.call('inspect_dom')
+    except Exception as err:
+        fail(err)
+
+
+@app.post('/api/browser/close')
+def browser_close():
+    try:
+        return controller.call('close')
+    except Exception as err:
+        fail(err)
+
+
+class RecordInput(BaseModel):
+    name: str
+
+
+@app.post('/api/recorder/start')
+def recorder_start():
+    try:
+        return controller.call('start')
+    except Exception as err:
+        fail(err)
+
+
+@app.post('/api/recorder/pause')
+def recorder_pause():
+    try:
+        return controller.call('pause')
+    except Exception as err:
+        fail(err)
+
+
+@app.post('/api/recorder/resume')
+def recorder_resume():
+    try:
+        return controller.call('resume')
+    except Exception as err:
+        fail(err)
+
+
+@app.get('/api/browser/recorder-health')
+def browser_recorder_health():
+    try:
+        return controller.call('health')
+    except Exception as err:
+        fail(err)
+
+
+@app.get('/api/recorder/preview')
+def recorder_preview():
+    try:
+        return controller.call('preview')
+    except Exception as err:
+        fail(err)
+
+
+@app.post('/api/recorder/stop')
+def recorder_stop(data: RecordInput):
+    if not WORKFLOW_PATTERN.fullmatch(data.name):
+        raise HTTPException(400, 'Workflow name must use lowercase letters, digits, underscores or hyphens')
+    try:
+        current = controller.call('status')
+        if not (current.get('recording') or current.get('paused')) or not current.get('project_id'):
+            raise ValueError('Recording has not been started')
+        path = workflow_path(current['project_id'], data.name)
+        if path.exists():
+            raise ValueError('Workflow already exists. Choose a new name; existing workflows are not overwritten')
+        stopped = controller.call('stop')
+        if not stopped['steps']:
+            raise ValueError('No supported steps captured. Retry with a short demo workflow')
+        draft, library = convert_recording(stopped['project_id'], data.name, stopped['start_url'], stopped['steps'])
+        # Existing locator keys are never overwritten; save both project-scoped files.
+        save_library(library)
+        atomic_json(path,draft.model_dump_json(indent=2))
+        # Save a separate, unapproved draft of browser-native negative cases.
+        proposed = generate_candidates(draft, library)
+        negative_path = path.with_suffix('.negative_cases.json')
+        atomic_json(negative_path, json.dumps({
+            'project_id': draft.project_id, 'workflow': draft.name,
+            'source': 'recorded_html_constraints', 'reviewed': False,
+            'cases': proposed,
+            'note': 'Candidate input constraints, NOT verified ERP business rules'
+        }, indent=2))
+        with connect() as c:
+            c.execute('INSERT INTO workflows (project_id,name,reviewed,step_count) VALUES(?,?,0,?)', (draft.project_id,draft.name,len(draft.steps)))
+        return {'workflow': draft.model_dump(), 'warnings': stopped['warnings'], 'negative_candidates':len(proposed)}
+    except Exception as err:
+        fail(err)
+
+
+@app.get('/api/workflows')
+def workflows(project_id: str | None = None):
+    with connect() as c:
+        if project_id:
+            rows = c.execute('SELECT * FROM workflows WHERE project_id=? ORDER BY updated_at DESC',(project_id,)).fetchall()
+        else:
+            rows = c.execute('SELECT * FROM workflows ORDER BY updated_at DESC').fetchall()
+    return [dict(r) for r in rows]
+
+
+@app.delete('/api/workflows/{project_id}/{name}')
+def remove_saved_workflow(project_id: str, name: str):
+    # Only the requested project/workflow is removed from the active backend list.
+    # The JSON is archived locally; executions and other ERP projects stay intact.
+    try:
+        return archive_saved_workflow(project_id, name)
+    except FileNotFoundError as err:
+        raise HTTPException(404, str(err)) from err
+    except ValueError as err:
+        raise HTTPException(409, str(err)) from err
+    except Exception as err:
+        fail(err)
+
+
+def load_workflow(project_id, name):
+    if not get_project(project_id):
+        raise HTTPException(404, 'Project not found')
+    try:
+        path = workflow_path(project_id, name)
+        if not path.exists():
+            raise HTTPException(404,'Workflow not found')
+        result = Workflow.model_validate_json(path.read_text(encoding='utf-8'))
+        if result.project_id != project_id or result.name != name:
+            raise ValueError('Workflow belongs to a different project/name')
+        return result
+    except HTTPException:
+        raise
+    except Exception as err:
+        fail(err)
+
+
+@app.get('/api/projects/{project_id}/locators')
+def locator_library_get(project_id: str):
+    try:
+        return read_library(project_id)
+    except Exception as err:
+        fail(err)
+
+
+@app.put('/api/projects/{project_id}/locators')
+def locator_library_update(project_id: str, updated: LocatorLibrary):
+    if updated.project_id != project_id:
+        raise HTTPException(400,'Project locator library identity mismatch')
+    try:
+        previous=read_library(project_id)
+        if previous.model_dump() != updated.model_dump():
+            # Reject removal of a field still used by a saved workflow.
+            with connect() as c:
+                rows=c.execute('SELECT name FROM workflows WHERE project_id=?',(project_id,)).fetchall()
+            workflows_v2=[]
+            for row in rows:
+                stored=load_workflow(project_id,row['name'])
+                if stored.schema_version==2:
+                    fingerprint(stored,updated)
+                    workflows_v2.append(stored)
+            save_library(updated)
+            # Reset approvals of workflows referring to edited locators.
+            for stored in workflows_v2:
+                if fingerprint(stored,previous)!=fingerprint(stored,updated):
+                    stored.reviewed=False
+                    atomic_json(workflow_path(project_id,stored.name),stored.model_dump_json(indent=2))
+                    with connect() as c:
+                        c.execute('UPDATE workflows SET reviewed=0 WHERE project_id=? AND name=?',(project_id,stored.name))
+        return updated
+    except Exception as err:
+        fail(err)
+
+
+@app.post('/api/workflows/{project_id}/{name}/convert-v2')
+def convert_v1_workflow(project_id: str, name: str):
+    existing=load_workflow(project_id,name)
+    if existing.schema_version!=1:
+        raise HTTPException(400,'Workflow is already JSON-driven v2')
+    try:
+        steps=[s.model_dump(exclude={'target'},exclude_none=True) for s in existing.steps]
+        updated, library=convert_recording(project_id,name,existing.start_url,steps)
+        path=workflow_path(project_id,name)
+        backup=path.with_suffix('.v1-backup.json')
+        if backup.exists():
+            raise ValueError('Legacy backup already exists; manual review required')
+        # Keep original workflow before converting; the backup is not loaded by the UI.
+        atomic_json(backup,path.read_text(encoding='utf-8'))
+        save_library(library)
+        atomic_json(path,updated.model_dump_json(indent=2))
+        with connect() as c:
+            c.execute('UPDATE workflows SET reviewed=0 WHERE project_id=? AND name=?',(project_id,name))
+        return updated
+    except Exception as err:
+        fail(err)
+
+
+@app.post('/api/locator/test-target')
+def locator_test_target(data: dict):
+    project_id=data.get('project_id')
+    target=data.get('target')
+    try:
+        if controller.call('status').get('project_id') != project_id:
+            raise ValueError('Open the matching ERP before testing its locator')
+        lib=read_library(project_id)
+        if target not in lib.fields:
+            raise ValueError('Unknown locator target')
+        return controller.call('test_locator',spec=lib.fields[target].locator.model_dump(exclude_none=True))
+    except Exception as err:
+        fail(err)
+
+
+@app.get('/api/workflows/{project_id}/{name}/pom-bundle')
+def export_workflow_pom_bundle(project_id: str, name: str):
+    """Export reviewed JSON to a POM+pytest ZIP; never performs ERP actions."""
+    try:
+        workflow = load_workflow(project_id, name)
+        data = create_bundle(workflow)
+        return Response(data, media_type='application/zip', headers={
+            'Content-Disposition': f'attachment; filename="{project_id}_{name}_pom.zip"',
+            'Cache-Control': 'no-store',
+            'X-Content-Type-Options': 'nosniff'
+        })
+    except HTTPException:
+        raise
+    except Exception as err:
+        fail(err)
+
+
+@app.get('/api/workflows/{project_id}/{name}/python')
+def export_workflow_python(project_id: str, name: str):
+    try:
+        workflow = load_workflow(project_id, name)
+        content = generate_python(workflow)
+        return PlainTextResponse(content, headers={
+            'Content-Disposition': f'attachment; filename="{name}.py"',
+            'X-Content-Type-Options': 'nosniff',
+            'Cache-Control': 'no-store'
+        })
+    except HTTPException:
+        raise
+    except Exception as err:
+        fail(err)
+
+
+@app.get('/api/workflows/{project_id}/{name}')
+def workflow_get(project_id:str, name:str):
+    return load_workflow(project_id,name)
+
+
+@app.put('/api/workflows/{project_id}/{name}')
+def workflow_update(project_id:str, name:str, updated: Workflow):
+    original = load_workflow(project_id,name)
+    if updated.project_id != project_id or updated.name != name:
+        raise HTTPException(400, 'Cannot change workflow identity')
+    if updated.start_url != original.start_url:
+        raise HTTPException(400, 'Cannot change the start URL using editor')
+    # Approved workflows must be reviewed again after any modification.
+    updated.reviewed = False
+    path = workflow_path(project_id,name)
+    if updated.schema_version == 2:
+        updated.locator_fingerprint=fingerprint(updated,read_library(project_id))
+    atomic_json(path,updated.model_dump_json(indent=2))
+    with connect() as c:
+        c.execute('UPDATE workflows SET reviewed=0,step_count=?,updated_at=CURRENT_TIMESTAMP WHERE project_id=? AND name=?',(len(updated.steps),project_id,name))
+    return updated
+
+
+@app.post('/api/workflows/{project_id}/{name}/approve')
+def approve_workflow(project_id:str, name:str):
+    data = load_workflow(project_id,name)
+    if not data.steps:
+        raise HTTPException(400,'Cannot approve an empty workflow')
+    if data.schema_version == 2:
+        lib=read_library(project_id)
+        if data.locator_fingerprint != fingerprint(data,lib):
+            raise HTTPException(400,'Locator mappings changed; re-save workflow after review')
+    if any(s.observed_count != 1 for s in data.steps):
+        raise HTTPException(400,'Some steps were not uniquely observed. Edit/re-record and verify the locator before approval')
+    data.reviewed = True
+    atomic_json(workflow_path(project_id,name),data.model_dump_json(indent=2))
+    with connect() as c:
+        c.execute('UPDATE workflows SET reviewed=1, updated_at=CURRENT_TIMESTAMP WHERE project_id=? AND name=?',(project_id,name))
+    return {'reviewed':True,'step_count':len(data.steps),'note':'Playwright revalidates uniqueness at replay time'}
+
+
+class LocatorInput(BaseModel):
+    locator: LocatorSpec
+
+
+@app.post('/api/locator/test')
+def locator_test(data: LocatorInput):
+    try:
+        return controller.call('test_locator',spec=data.locator.model_dump(exclude_none=True))
+    except Exception as err:
+        fail(err)
+
+
+class RunInput(BaseModel):
+    project_id: str
+    name: str
+    allow_test_transactions: bool = False
+    allow_nav_repair: bool = False
+    reuse_existing_login: bool = False  # Only the current-session replay opts in.
+    test_data: dict[str, str | int | float | bool] = Field(default_factory=dict, max_length=100)
+
+
+@app.get('/api/workflows/{project_id}/{name}/negative-candidates')
+def negative_candidates(project_id: str, name: str):
+    """Propose browser-native negative cases only. No interaction or AI guess."""
+    wf = load_workflow(project_id, name)
+    try:
+        cases = generate_candidates(wf, read_library(project_id))
+        return {'project_id':project_id,'workflow':name,'cases':cases,
+                'note':'Draft cases derived from recorded HTML constraints; review before running. ERP business rules are not inferred.'}
+    except Exception as err:
+        fail(err)
+
+
+class NegativeInput(BaseModel):
+    project_id: str
+    name: str
+    confirm_safe_test: bool = False
+
+
+@app.post('/api/workflows/run-negative')
+def run_negative(data: NegativeInput):
+    if not data.confirm_safe_test:
+        raise HTTPException(400, 'Confirm testing approved TEST/STAGING form, with no Save/Submit')
+    project=get_project(data.project_id)
+    if not project or project['environment'] not in ('test','staging'):
+        raise HTTPException(400,'Negative checks require registered test/staging project')
+    wf=load_workflow(data.project_id,data.name)
+    if not wf.reviewed:
+        raise HTTPException(400,'Review and approve the positive workflow first')
+    lib=read_library(data.project_id)
+    try:
+        cases=generate_candidates(wf,lib)
+        if not cases:
+            raise ValueError('No native field constraints captured; configure business rules first')
+        selected=[dict(c,locator=lib.fields[c['target']].locator.model_dump(exclude_none=True)) for c in cases]
+        report=controller.call('negative_check',workflow={'project_id':data.project_id,'name':data.name,'reviewed':True},cases=selected)
+        # Report only genuine HTML-invalid checks as passing. Unsupported is not a pass.
+        failed=report['summary']['FAILED']
+        report['status']='FAILED' if failed else ('PASSED' if report['summary']['PASSED']==len(cases) else 'COMPLETED_WITH_WARNINGS')
+        report['failed_step']=None
+        report['message']=f"Native negative checks: {report['summary']}"
+        report['report_path']=None
+        save_execution(report)
+        return report
+    except Exception as err:
+        fail(err)
+
+
+@app.get('/api/workflows/{project_id}/{name}/preflight-first')
+def preflight_first(project_id: str, name: str, reuse_existing_login: bool = False):
+    """Diagnose the first locator and the current browser screen without touching the ERP."""
+    try:
+        original = load_workflow(project_id, name)
+        library = read_library(project_id) if original.schema_version == 2 else LocatorLibrary(project_id=project_id)
+        workflow, skipped = (planned_existing_session_workflow(original, library)
+                             if reuse_existing_login else (original, 0))
+        if not workflow.steps:
+            raise ValueError('This workflow has no executable business actions')
+        first = workflow.steps[0]
+        if workflow.schema_version == 2:
+            if not first.target or first.target not in library.fields:
+                raise ValueError('First-step locator target is missing from the project locator library')
+            spec = library.fields[first.target].locator.model_dump(exclude_none=True)
+            current_review = workflow.reviewed and workflow.locator_fingerprint == fingerprint(workflow, library)
+        else:
+            spec = first.locator.model_dump(exclude_none=True)
+            current_review = workflow.reviewed
+        diagnosis = controller.call('preflight_first',project_id=project_id,workflow_name=name,
+                                    first_step={'locator':spec,'action':first.action,'target_text':first.target_text,
+                                                'observed_candidates':first.observed_candidates},
+                                    start_url=first.page_url or workflow.start_url,reviewed=current_review)
+        diagnosis['skipped_initial_login_steps'] = skipped
+        diagnosis['first_executable_step_number'] = skipped + 1
+        diagnosis['session_mode'] = 'reuse_existing_login' if reuse_existing_login else 'standard'
+        return diagnosis
+    except Exception as err:
+        fail(err)
+
+
+@app.post('/api/workflows/run')
+def run_workflow(data: RunInput):
+    workflow = load_workflow(data.project_id, data.name)
+    try:
+        library = read_library(data.project_id) if workflow.schema_version == 2 else LocatorLibrary(project_id=data.project_id)
+        prepared, skipped = (planned_existing_session_workflow(workflow, library)
+                             if data.reuse_existing_login else (workflow, 0))
+        executable = resolve_locators(prepared, library, data.test_data)
+        if data.reuse_existing_login:
+            executable['reuse_existing_login'] = True
+            executable['skipped_initial_login_steps'] = skipped
+            for idx, step in enumerate(executable['steps'], start=skipped + 1):
+                step['original_step_number'] = idx
+        report = controller.call('run', workflow=executable, allow_writes=data.allow_test_transactions,
+                                 allow_nav_repair=data.allow_nav_repair)
+        save_execution(report, data.project_id, data.name)
+        return report
+    except Exception as err:
+        fail(err)
+
+
+class RunFromLoginInput(RunInput):
+    embedded: bool = False
+    username: str = Field(min_length=1, max_length=200)
+    password: SecretStr
+
+
+@app.post('/api/workflows/run-from-login')
+def run_from_login(data: RunFromLoginInput):
+    """Fresh browser → verified login → reviewed workflow. No password persistence."""
+    workflow = load_workflow(data.project_id, data.name)
+    project = get_project(data.project_id)
+    if not project:
+        raise HTTPException(404, 'Project not found')
+    if project['environment'] == 'production':
+        raise HTTPException(400, 'Automatic test execution on production is disabled')
+    if not workflow.reviewed:
+        raise HTTPException(400, 'Review and approve the recorded workflow first')
+    try:
+        library = read_library(data.project_id) if workflow.schema_version == 2 else LocatorLibrary(project_id=data.project_id)
+        # Run From Login already authenticates. Do not replay an old leading
+        # username/password/Sign In sequence a second time after verification.
+        prepared, skipped = planned_existing_session_workflow(workflow, library)
+        executable = resolve_locators(prepared, library, data.test_data)
+        executable['skipped_initial_login_steps'] = skipped
+        for idx, step in enumerate(executable['steps'], start=skipped + 1):
+            step['original_step_number'] = idx
+        config = load_login_config(data.project_id)
+        controller.call('open', project=project, embedded=data.embedded)
+        try:
+            controller.call('login',
+                config=config.model_dump(exclude={'schema_version','project_id','project_url'}),
+                username=data.username,
+                password=data.password.get_secret_value()
+            )
+        except Exception:
+            # Preserve only a generic message, not any Playwright/credential detail.
+            report = {
+                'project_id': data.project_id,
+                'workflow': data.name,
+                'status': 'FAILED',
+                'completed_steps': 0,
+                'failed_step': 0,
+                'login_verified': False,
+                'message': 'Automatic login not verified; check configured locators or authenticate manually.',
+                'screenshot': None, 'trace': None, 'report_path': None,
+                'assertions': 'not_implemented'
+            }
+            save_execution(report)
+            return report
+        report = controller.call('run', workflow=executable, allow_writes=data.allow_test_transactions,
+                                 allow_nav_repair=data.allow_nav_repair)
+        report['login_verified'] = True
+        report['run_mode'] = 'inside_dashboard' if data.embedded else 'new_browser'
+        save_execution(report)
+        return report
+    except Exception as err:
+        fail(err)
+
+
+def save_execution(report: dict, project_id: str | None=None, workflow_name: str | None=None):
+    with connect() as c:
+        c.execute(
+            'INSERT INTO executions (project_id,workflow_name,status,step_number,message,artifact_path,ended_at) '
+            'VALUES (?,?,?,?,?,?,CURRENT_TIMESTAMP)',
+            (project_id or report['project_id'], workflow_name or report['workflow'], report['status'], report.get('failed_step'),
+             report.get('message', ''), report.get('report_path'))
+        )
+
+
+class AnalyzeInput(BaseModel):
+    execution_id: int = Field(gt=0)
+
+
+@app.post('/api/ai/diagnose')
+def ai_diagnose(data: AnalyzeInput):
+    with connect() as conn:
+        row = conn.execute('SELECT * FROM executions WHERE id=?', (data.execution_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, 'Execution not found')
+    if row['status'] != 'FAILED':
+        raise HTTPException(400, 'AI suggestions are available for failed executions only')
+    # Do not include raw ERP URLs, messages, CSS, form values, screenshots or traces.
+    action = 'unknown'
+    if row['step_number'] and row['step_number'] > 0:
+        try:
+            steps = load_workflow(row['project_id'], row['workflow_name']).steps
+            idx = row['step_number'] - 1
+            if 0 <= idx < len(steps):
+                action = steps[idx].action
+        except Exception:
+            pass
+    summary = safe_summary(message=row['message'] or '', step_number=row['step_number'], action=action)
+    try:
+        answer = diagnose_local(summary)
+        return {'provider': 'local_ollama', 'suggestion': answer, 'reason': summary['reason'], 'auto_actions': False}
+    except Exception as err:
+        # Never silently claim that AI works without a running local model.
+        fail(err)
+
+
+# Multi-ERP approval plans: accounts and stages are configured separately.
+class CaseProposalInput(BaseModel):
+    project_id:str
+    workflow_name:str
+    provider:str='rules'
+    model:str|None=None
+
+@app.post('/api/ai/test-cases')
+def ai_test_case_ideas(data:CaseProposalInput):
+    # Explicit external service selection; NEVER automatically send ERP data.
+    from backend.ai_case_proposals import generate_ideas
+    try:
+        return generate_ideas(data.project_id,data.workflow_name,data.provider,data.model)
+    except Exception as err:
+        fail(err)
+
+@app.get('/api/approval-plans')
+def plans_list():
+    return list_plans()
+
+@app.get('/api/approval-plans/{project_id}/{name}')
+def plan_get(project_id:str,name:str):
+    try:
+        return load_plan(project_id,name)
+    except FileNotFoundError:
+        raise HTTPException(404,'Approval plan not found')
+    except Exception as err:
+        fail(err)
+
+@app.put('/api/approval-plans/{project_id}/{name}')
+def plan_put(project_id:str,name:str, plan:ApprovalPlan):
+    if plan.project_id!=project_id or plan.name!=name:
+        raise HTTPException(400,'Cannot change approval plan identity')
+    try:
+        return save_plan(plan)
+    except Exception as err:
+        fail(err)
+
+@app.get('/api/approval-plans/{project_id}/{name}/preview')
+def plan_preview(project_id:str,name:str):
+    try:
+        return preview_plan(load_plan(project_id,name))
+    except FileNotFoundError:
+        raise HTTPException(404,'Approval plan not found')
+    except Exception as err:
+        fail(err)
+
+class PlanRunInput(BaseModel):
+    project_id:str
+    name:str
+    allow_test_transactions:bool=False
+    test_data:dict[str,str|int|float|bool]=Field(default_factory=dict,max_length=100)
+
+@app.post('/api/approval-plans/run')
+def plan_run(request:PlanRunInput):
+    project=get_project(request.project_id)
+    if not project or project['environment'] not in ('test','staging'):
+        raise HTTPException(400,'Approval plan execution requires a registered TEST/STAGING ERP')
+    if not request.allow_test_transactions:
+        raise HTTPException(400,'Explicitly authorize record changes in your test/staging ERP')
+    try:
+        plan=load_plan(request.project_id,request.name)
+        # Preflight the full plan BEFORE the first login/record change.
+        check=preview_plan(plan,request.test_data)
+        if not check['ready']:
+            raise ValueError('Approval plan is not ready: '+'; '.join(check['issues'][:10]))
+        if controller.call('status').get('project_id')!=request.project_id:
+            raise ValueError('Open the matching ERP browser first')
+        workflows=executable_specs(plan,require_ready=False)
+        aliases=sorted({s.account for s in plan.stages if s.account})
+        accounts=local_accounts(plan.project_id,aliases)
+        login_config=(load_login_config(plan.project_id).model_dump(
+            exclude={'schema_version','project_id','project_url'}) if aliases else {})
+        result=controller.call('run_plan',plan=plan.model_dump(),workflows=workflows,
+            login_config=login_config,accounts=accounts,allow_writes=True,
+            test_data=request.test_data)
+        save_execution(result,request.project_id,request.name)
+        return result
+    except Exception as err:
+        fail(err)
+
+@app.get('/api/executions')
+def executions():
+    with connect() as c:
+        rows = c.execute('SELECT id,project_id,workflow_name,status,step_number,message,started_at,ended_at FROM executions ORDER BY id DESC LIMIT 100').fetchall()
+    return [dict(r) for r in rows]
+
+
+@app.get('/api/metrics')
+def metrics():
+    with connect() as c:
+        projects_count = c.execute('SELECT COUNT(*) FROM projects').fetchone()[0]
+        workflows_count = c.execute('SELECT COUNT(*) FROM workflows').fetchone()[0]
+        runs = c.execute('SELECT COUNT(*) FROM executions').fetchone()[0]
+        failed = c.execute('SELECT COUNT(*) FROM executions WHERE status="FAILED"').fetchone()[0]
+    return {'projects':projects_count,'workflows':workflows_count,'executions':runs,'failed':failed}
+
+# This is a local sandbox only, never an actual ERP service.
+from backend.mock import router as mock_router
+app.include_router(mock_router)
+
+# V5: shared Page Object Model templates, project locator mappings and safe review.
+from backend.pom import (create_template_from_workflow, read_template, list_templates,
+                         read_map, save_map, approve_map, compile_pom, ProjectFieldMap,
+                         map_fingerprint, mapping_path, save_template, SharedTemplate)
+from backend.linked import LinkedPlan, inspect_plan
+
+
+class StepReviewRequest(BaseModel):
+    confirm_intended_element: bool = False
+
+
+@app.get('/api/workflows/{project_id}/{name}/step-review/{step_number}')
+def step_review_info(project_id: str, name: str, step_number: int):
+    workflow = load_workflow(project_id, name)
+    if not 1 <= step_number <= len(workflow.steps):
+        raise HTTPException(404, 'Step number outside workflow')
+    step = workflow.steps[step_number-1]
+    return {'step_number':step_number,'action':step.action,'target':step.target,
+            'target_text':step.target_text,'observed_count':step.observed_count,
+            'page_url':step.page_url,'candidates':[candidate for candidate in step.observed_candidates[:8]]}
+
+
+@app.post('/api/workflows/{project_id}/{name}/step-review/{step_number}/verify')
+def verify_recorded_step(project_id: str, name: str, step_number: int, request: StepReviewRequest):
+    if not request.confirm_intended_element:
+        raise HTTPException(400, 'Confirm you inspected the correct target element before verifying')
+    workflow = load_workflow(project_id,name)
+    if not 1 <= step_number <= len(workflow.steps):
+        raise HTTPException(404, 'Invalid step number')
+    status = controller.call('status')
+    if status.get('project_id') != project_id:
+        raise HTTPException(400,'Open the same registered ERP before verifying this step')
+    step = workflow.steps[step_number-1]
+    # Critical: test in the page context in which the step was originally observed.
+    if step.page_url and (status.get('url') or '').rstrip('/') != step.page_url.rstrip('/'):
+        raise HTTPException(400, 'Navigate to the recorded step page before verification; current URL differs')
+    try:
+        if workflow.schema_version == 2:
+            lib=read_library(project_id)
+            field=lib.fields[step.target]
+            loc=field.locator.model_dump(exclude_none=True)
+        else:
+            loc=step.locator.model_dump(exclude_none=True)
+        result=controller.call('test_locator',spec=loc)
+        if result['count'] != 1 or not result['visible']:
+            raise ValueError('Locator is not uniquely visible on this page')
+        # Testing uniqueness is not proof of correct semantics: the user confirms intent.
+        step.observed_count=1
+        workflow.reviewed=False
+        if workflow.schema_version==2:
+            field.observed_count=1
+            save_library(lib)
+            workflow.locator_fingerprint=fingerprint(workflow,lib)
+        atomic_json(workflow_path(project_id,name),workflow.model_dump_json(indent=2))
+        with connect() as c:
+            c.execute('UPDATE workflows SET reviewed=0,updated_at=CURRENT_TIMESTAMP WHERE project_id=? AND name=?',(project_id,name))
+        return {'verified_unique':True,'step_number':step_number,'count':1,
+                'note':'Review remaining steps before approving. No click or submit was performed.'}
+    except Exception as err:
+        fail(err)
+
+
+class POMCreateInput(BaseModel):
+    project_id: str
+    workflow_name: str
+    template_name: str
+
+
+@app.post('/api/pom/create-from-workflow')
+def pom_create_template(data: POMCreateInput):
+    try:
+        wf=load_workflow(data.project_id,data.workflow_name)
+        template, mapping=create_template_from_workflow(wf,data.template_name)
+        return {'template':template,'mapping':mapping,'next':'Map the same logical fields in each new ERP project'}
+    except Exception as err:
+        fail(err)
+
+
+@app.get('/api/pom/templates')
+def pom_template_names():
+    return list_templates()
+
+
+@app.get('/api/pom/templates/{name}')
+def pom_read_template(name: str):
+    try:
+        return read_template(name)
+    except Exception as err:
+        fail(err)
+
+
+@app.get('/api/pom/maps/{project_id}/{name}')
+def pom_get_mapping(project_id: str, name: str):
+    try:
+        return read_map(project_id,name)
+    except Exception as err:
+        fail(err)
+
+
+@app.put('/api/pom/maps/{project_id}/{name}')
+def pom_set_mapping(project_id: str, name: str, updated: ProjectFieldMap):
+    if updated.project_id != project_id or updated.template_name != name:
+        raise HTTPException(400,'Mapping belongs to a different ERP project/template')
+    try:
+        return save_map(updated)
+    except Exception as err:
+        fail(err)
+
+
+@app.post('/api/pom/maps/{project_id}/{name}/approve')
+def pom_approve_mapping(project_id: str, name: str):
+    try:
+        return approve_map(project_id,name)
+    except Exception as err:
+        fail(err)
+
+
+class POMRunInput(BaseModel):
+    project_id: str
+    template_name: str
+    test_data: dict[str, str | int | float | bool] = Field(default_factory=dict)
+    allow_test_transactions: bool = False
+
+
+@app.post('/api/pom/preview')
+def pom_preview(data: POMRunInput):
+    try:
+        spec=compile_pom(data.project_id,data.template_name,data.test_data)
+        # Never return recorded text input values or raw business data as diagnostic text.
+        return {'project_id':spec['project_id'],'template_name':spec['name'],
+                'start_url':spec['start_url'],'steps':len(spec['steps']),
+                'actions':[{'number':i,'action':s['action'],'field':s['logical_field']} for i,s in enumerate(spec['steps'],1)],
+                'ready':True}
+    except Exception as err:
+        fail(err)
+
+
+@app.post('/api/pom/run')
+def pom_run(data: POMRunInput):
+    project=get_project(data.project_id)
+    if not project or project['environment'] not in ('test','staging'):
+        raise HTTPException(400,'POM execution requires TEST/STAGING project')
+    if not data.allow_test_transactions:
+        raise HTTPException(400,'Explicit test-transaction confirmation is required for shared POM execution')
+    try:
+        spec=compile_pom(data.project_id,data.template_name,data.test_data)
+        report=controller.call('run',workflow=spec,allow_writes=True)
+        save_execution(report)
+        return report
+    except Exception as err:
+        fail(err)
+
+
+@app.post('/api/pom/linked/preview')
+def pom_linked_preview(plan: LinkedPlan):
+    try:
+        return inspect_plan(plan)
+    except Exception as err:
+        fail(err)
+
+
+@app.post('/api/pom/linked/run')
+def pom_linked_run(plan: LinkedPlan):
+    """Run reviewed POM stages in order in the SAME authorized browser role.
+
+    Captures actual IDs from explicit `capture_*` steps; on any failed stage
+    stops and marks downstream stages BLOCKED. Never auto-retries writes.
+    """
+    try:
+        check=inspect_plan(plan)  # Entire dependency preflight BEFORE first action.
+        status=controller.call('status')
+        if status.get('project_id') != plan.project_id or not status.get('open'):
+            raise ValueError('Open and authenticate the matching ERP in a Playwright browser first')
+        context={}
+        reports=[]
+        blocked=False
+        for stage in plan.stages:
+            if blocked:
+                reports.append({'workflow':stage.template,'status':'BLOCKED','reason':'Earlier dependent workflow failed'})
+                continue
+            spec=compile_pom(plan.project_id,stage.template,plan.test_data,context)
+            report=controller.call('run',workflow=spec,allow_writes=True)
+            save_execution(report)
+            reports.append(report)
+            if report['status']=='PASSED':
+                context.update(report.get('outputs',{}))
+            else:
+                blocked=True
+        return {'project_id':plan.project_id,'status':'FAILED' if blocked else 'PASSED',
+                'stages':reports,'captured_context':context,
+                'note':'Only the configured same-role stages were executed. High-impact role transitions are not automatic.'}
+    except Exception as err:
+        fail(err)
+
+@app.get('/api/workflows/{project_id}/{name}/step-review/{step_number}/candidates')
+def candidate_locators(project_id: str, name: str, step_number: int):
+    """Offer only locators that Playwright confirms are uniquely visible.
+
+    Candidate discovery is deterministic; local AI diagnosis remains optional.
+    No locator is changed, approved or clicked by this endpoint.
+    """
+    wf=load_workflow(project_id,name)
+    if not 1 <= step_number <= len(wf.steps):
+        raise HTTPException(404, 'Invalid step number')
+    if controller.call('status').get('project_id') != project_id:
+        raise HTTPException(400, 'Open the correct ERP browser first')
+    step=wf.steps[step_number-1]
+    matches=[]
+    for candidate in step.observed_candidates[:8]:
+        raw=candidate.get('spec') if isinstance(candidate,dict) else None
+        if not raw:
+            continue
+        try:
+            info=controller.call('test_locator',spec=LocatorSpec.model_validate(raw).model_dump(exclude_none=True))
+            matches.append({'locator':raw,'count':info['count'],'visible':info['visible'],
+                            'usable_candidate':info['count']==1 and info['visible']})
+        except Exception:
+            matches.append({'locator':raw,'count':0,'visible':False,'usable_candidate':False})
+    return {'step_number':step_number,'candidates':matches,
+            'note':'Potential alternatives only. Review semantic target, edit locator library, then verify the step. No automatic repair.'}
+
+@app.put('/api/pom/templates/{name}')
+def pom_update_template(name: str, updated: SharedTemplate):
+    try:
+        return save_template(name, updated)
+    except Exception as err:
+        fail(err)
+
+@app.post('/api/workflows/{project_id}/{name}/step-review/{step_number}/ai-suggest')
+def ai_suggest_locator(project_id: str, name: str, step_number: int):
+    from backend.ai_assistant import rank_locator_candidates_local
+    try:
+        options=candidate_locators(project_id,name,step_number)
+        step=load_workflow(project_id,name).steps[step_number-1]
+        proposal=rank_locator_candidates_local(options['candidates'],step.action)
+        return {**proposal,'candidate':options['candidates'][proposal['candidate_index']]['locator']}
+    except HTTPException:
+        raise
+    except Exception as err:
+        fail(err)
+
+@app.get('/api/pom/negative-candidates/{project_id}/{name}')
+def pom_negative_cases(project_id: str, name: str):
+    from backend.pom import pom_native_negative_candidates
+    try:
+        return {'project_id':project_id,'template_name':name,
+                'cases':pom_native_negative_candidates(project_id,name),
+                'note':'Unreviewed HTML5 candidates only; no ERP business rule inference'}
+    except Exception as err:
+        fail(err)
+
+
+class POMNegativeInput(BaseModel):
+    project_id: str
+    template_name: str
+    confirm_safe_test: bool = False
+
+
+@app.post('/api/pom/run-negative')
+def pom_run_negative(data: POMNegativeInput):
+    from backend.pom import pom_native_negative_candidates
+    if not data.confirm_safe_test:
+        raise HTTPException(400,'Confirm approved test/staging CURRENT form before negative checks')
+    try:
+        project=get_project(data.project_id)
+        if not project or project['environment'] not in ('test','staging'):
+            raise ValueError('Only TEST/STAGING projects permitted')
+        cases=pom_native_negative_candidates(data.project_id,data.template_name)
+        if not cases:
+            raise ValueError('No verified native HTML constraints found; configure ERP business rules first')
+        lib=read_library(data.project_id)
+        selected=[dict(c,locator=lib.fields[c['target']].locator.model_dump(exclude_none=True)) for c in cases]
+        report=controller.call('negative_check',workflow={
+            'project_id':data.project_id,'name':data.template_name,'reviewed':True},cases=selected)
+        failed=report['summary']['FAILED']
+        report['status']='FAILED' if failed else ('PASSED' if report['summary']['PASSED']==len(cases) else 'COMPLETED_WITH_WARNINGS')
+        report['failed_step']=None
+        report['message']=f"POM native negative checks: {report['summary']}"
+        report['report_path']=None
+        save_execution(report)
+        return report
+    except Exception as err:
+        fail(err)
+
+# Smart ERP QA read-only workflow execution reporting
+from backend.reporting import router as qa_reporting_router
+app.include_router(qa_reporting_router)
+
+# v6.1.4 — recorded stage -> reusable project-mapped procurement flow.
+# Recording, locator review and all normal workflow approvals remain unchanged.
+from backend.flow_studio import (BusinessFlow, load_flow, save_flow, list_flows,
+                                 starter_flow, preview_flow)
+
+
+class FlowPreviewInput(BaseModel):
+    test_data: dict[str, str | int | float | bool] = Field(default_factory=dict, max_length=100)
+
+
+class FlowRunInput(FlowPreviewInput):
+    project_id: str
+    name: str
+    allow_test_transactions: bool = False
+    confirm_same_session: bool = False
+
+
+@app.post('/api/flows/prepare-browser')
+def flow_prepare_browser():
+    """Explicitly finish passive capture before running a same-session flow."""
+    try:
+        return controller.call('prepare_flow')
+    except Exception as err:
+        fail(err)
+
+
+@app.get('/api/flows')
+def flows_index():
+    return list_flows()
+
+
+@app.get('/api/flows/starter/{project_id}')
+def new_flow_starter(project_id: str):
+    try:
+        return starter_flow(project_id)
+    except Exception as err:
+        fail(err)
+
+
+@app.get('/api/flows/{project_id}/{name}')
+def flow_get(project_id: str, name: str):
+    try:
+        return load_flow(project_id, name).model_dump()
+    except Exception as err:
+        fail(err)
+
+
+@app.put('/api/flows/{project_id}/{name}')
+def flow_save(project_id: str, name: str, flow: BusinessFlow):
+    if (project_id, name) != (flow.project_id, flow.name):
+        raise HTTPException(400, 'Flow identity cannot change')
+    try:
+        return save_flow(flow)
+    except Exception as err:
+        fail(err)
+
+
+@app.post('/api/flows/{project_id}/{name}/preview')
+def flow_preview(project_id: str, name: str, data: FlowPreviewInput):
+    try:
+        return preview_flow(load_flow(project_id, name), data.test_data)
+    except Exception as err:
+        fail(err)
+
+
+@app.post('/api/flows/run')
+def flow_run(data: FlowRunInput):
+    try:
+        if not data.allow_test_transactions or not data.confirm_same_session:
+            raise ValueError('Confirm authorized test transactions in the same manually logged-in browser session')
+        flow = load_flow(data.project_id, data.name)
+        check = preview_flow(flow, data.test_data)
+        if not check['ready']:
+            raise ValueError('Flow is not ready: ' + '; '.join(check['issues'][:6]))
+        if controller.call('status').get('project_id') != data.project_id:
+            raise ValueError('Open the matching ERP browser and log in manually first')
+        # Do not resolve locators or runtime variables before their producing
+        # stages execute. Every workflow is revalidated at its execution stage.
+        specs = [load_workflow(data.project_id, stage.workflow).model_dump() for stage in flow.stages]
+        result = controller.call('run_flow', flow=flow.model_dump(), stages=specs,
+                                 allow_writes=True, test_data=data.test_data)
+        save_execution(result, data.project_id, data.name)
+        return result
+    except Exception as err:
+        fail(err)
+
+# v6.2.8: one ERP project, many independently selectable modules/processes.
+from fastapi import UploadFile, File, Form
+from fastapi.responses import StreamingResponse
+import io as _io
+from backend import module_suite as suite
+from backend.locator import Step
+suite.init_suite_db()
+
+
+@app.get('/api/suite/catalog/{project_id}')
+def suite_catalog(project_id: str):
+    try: return suite.catalog(project_id)
+    except Exception as err: fail(err)
+
+
+@app.put('/api/suite/catalog/{project_id}/{workflow_name}')
+def suite_assign(project_id: str, workflow_name: str, body: suite.CatalogLink):
+    try: return suite.link_workflow(project_id, workflow_name,body.module,body.process)
+    except Exception as err: fail(err)
+
+
+@app.post('/api/suite/scripts/upload')
+async def suite_script_upload(project_id:str=Form(...),module:str=Form(...),process:str=Form(...),script:UploadFile=File(...)):
+    try:
+        raw=await script.read(250001)
+        return suite.save_script(project_id,script.filename or '',module,process,raw)
+    except Exception as err: fail(err)
+
+
+class SuiteScriptIdeas(BaseModel):
+    project_id:str
+    filename:str
+    provider:str='rules'
+    model:str|None=None
+
+
+@app.post('/api/suite/scripts/generate')
+def suite_script_ideas(body:SuiteScriptIdeas):
+    try:return suite.propose_from_uploaded_script(body.project_id,body.filename,body.provider,body.model)
+    except Exception as err: fail(err)
+
+
+@app.get('/api/suite/cases/{project_id}')
+def suite_cases(project_id:str):
+    try:return suite.cases(project_id)
+    except Exception as err: fail(err)
+
+
+@app.get('/api/suite/metrics/{project_id}')
+def suite_metrics(project_id:str):
+    try:return suite.run_totals(project_id)
+    except Exception as err: fail(err)
+
+
+@app.get('/api/suite/excel/{project_id}')
+def suite_export(project_id:str,template:bool=False):
+    try:
+        content=suite.workbook(project_id,template)
+        name='SmartERP_Test_Case_Template.xlsx' if template else f'SmartERP_{project_id}_Test_Cases.xlsx'
+        return StreamingResponse(_io.BytesIO(content),media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            headers={'Content-Disposition':f'attachment; filename="{name}"'})
+    except Exception as err: fail(err)
+
+
+@app.post('/api/suite/excel/{project_id}/import')
+async def suite_import(project_id:str,workbook:UploadFile=File(...)):
+    try:
+        if not (workbook.filename or '').lower().endswith('.xlsx'):
+            raise ValueError('Upload an .xlsx Excel workbook')
+        content=await workbook.read(4000001)
+        return suite.import_excel(project_id,content)
+    except Exception as err: fail(err)
+
+
+@app.post('/api/suite/cases/approve')
+def suite_approve(body:suite.ApprovalInput):
+    try:return suite.approve_cases(body)
+    except Exception as err: fail(err)
+
+
+@app.post('/api/suite/run')
+def suite_execute(body:suite.RunSuiteInput):
+    if not suite.SUITE_LOCK.acquire(blocking=False):
+        raise HTTPException(409,'Another module-suite run is in progress')
+    run_id=None
+    try:
+        chosen=suite.plan_cases(body)
+        current=controller.call('status')
+        if not current.get('open') or current.get('project_id')!=body.project_id:
+            raise ValueError('Open this ERP from the dashboard and log in before running; your session will be reused')
+        if current.get('recording') or current.get('paused'):
+            raise ValueError('Finish the recording before running test cases')
+        project=get_project(body.project_id)
+        if project['environment']=='production':raise ValueError('Automation is disabled for production environments')
+        if body.allow_test_transactions and project['environment'] not in ('test','staging'):
+            raise ValueError('Transactions are restricted to TEST/STAGING')
+        # Fail before run if ANY mapping has no reviewed workflow, and capture updated locator approvals.
+        prepared=[]
+        for item in chosen:
+            wf=load_workflow(body.project_id,item['workflow_name'])
+            if not wf.reviewed:raise ValueError(f'{item["testcase_id"]}: workflow is not reviewed')
+            library=read_library(body.project_id) if wf.schema_version==2 else LocatorLibrary(project_id=body.project_id)
+            if wf.schema_version==2 and wf.locator_fingerprint!=fingerprint(wf,library):
+                raise ValueError(f'{item["testcase_id"]}: reviewed locator library changed; reapprove workflow')
+            no_login,skipped=planned_existing_session_workflow(wf,library)
+            executable=resolve_locators(no_login,library,{})
+            executable['reuse_existing_login']=True
+            executable['skipped_initial_login_steps']=skipped
+            for number,step in enumerate(executable['steps'],start=skipped+1):
+                step['original_step_number']=number
+            prepared.append((item,executable))
+        run_id=suite.create_run(body)
+        for item,executable in prepared:
+            # Excel does not contain executable test data or reliable role switching.
+            # Negative, boundary and role cases need dedicated verified adapters.
+            if item['polarity']=='Negative' or item['category'] in ('Boundary','Role-based'):
+                report={'project_id':body.project_id,'workflow':item['workflow_name'],'status':'BLOCKED',
+                    'message':'Requires an approved scenario-specific test data/assertion adapter; a happy-path workflow cannot verify this case.'}
+            elif not any(s['action'].startswith('assert_') for s in executable['steps']):
+                report={'project_id':body.project_id,'workflow':item['workflow_name'],'status':'BLOCKED',
+                    'message':'Workflow has no executable assertion. Completed clicks alone cannot produce a Pass.'}
+            else:
+                try:
+                    # Worker verifies ERP/URL/browser session again and captures failure evidence.
+                    report=controller.call('run',workflow=executable,allow_writes=body.allow_test_transactions,allow_nav_repair=False)
+                except Exception as err:
+                    try:
+                        evidence=controller.call('capture_failure',testcase_id=item['testcase_id'])
+                    except Exception:
+                        evidence={'screenshot':None}
+                    report={'project_id':body.project_id,'workflow':item['workflow_name'],
+                        'status':'FAILED','message':f'{type(err).__name__}: {str(err)[:500]}',
+                        'screenshot':evidence.get('screenshot')}
+                if report['status'] in ('PASSED','FAILED'):
+                    save_execution(report,body.project_id,item['workflow_name'])
+            suite.save_case_result(run_id,body.project_id,item,report)
+        results=suite.batch_results(run_id)
+        statuses=[r['status'] for r in results]
+        status='FAILED' if 'FAILED' in statuses else 'PARTIAL' if 'BLOCKED' in statuses else 'PASSED'
+        suite.complete_run(run_id,status)
+        return {'run_id':run_id,'status':status,'total':len(results),
+                'passed':statuses.count('PASSED'),'failed':statuses.count('FAILED'),
+                'blocked':statuses.count('BLOCKED'),'results':results,
+                'note':'Browser remained open and authenticated. No automatic login or page reload was performed.'}
+    except HTTPException:
+        if run_id:suite.complete_run(run_id,'FAILED')
+        raise
+    except Exception as err:
+        if run_id:suite.complete_run(run_id,'FAILED')
+        fail(err)
+    finally:
+        suite.SUITE_LOCK.release()
+
+
+@app.get('/api/suite/evidence/{result_id}/{artifact_kind}')
+def suite_evidence(result_id:int,artifact_kind:str):
+    if artifact_kind not in ('screenshot','trace','report_path'):
+        raise HTTPException(404,'Unknown evidence type')
+    with connect() as db:
+        row=db.execute('SELECT * FROM module_results WHERE id=?',(result_id,)).fetchone()
+    if not row or not row[artifact_kind]:raise HTTPException(404,'No evidence for this result')
+    path=(BASE/row[artifact_kind]).resolve()
+    artifact_root=(BASE/'artifacts').resolve()
+    if not path.is_relative_to(artifact_root) or not path.is_file():
+        raise HTTPException(404,'Evidence unavailable')
+    return FileResponse(path)
+
+
+# v6.3.0 trusted local Script Workspace. AI uploads remain analysis-only.
+from backend import script_workspace as sw
+
+@app.get('/api/script-workspace/catalog')
+def script_catalog():
+    return sw.catalog()
+
+@app.post('/api/script-workspace/run')
+def script_run(body: sw.ScriptRunInput):
+    try:
+        return script_manager.start(body, controller)
+    except Exception as err:
+        fail(err)
+
+@app.post('/api/script-workspace/stop')
+def script_stop():
+    return script_manager.stop()
+
+@app.get('/api/script-workspace/runs')
+def script_history(project_id: str = ''):
+    return {'runs': script_manager.history(project_id), 'active_id': script_manager.active_id}
+
+@app.get('/api/script-workspace/runs/{run_id}')
+def script_detail(run_id: str):
+    try: return script_manager.detail(run_id)
+    except Exception as err: fail(err)
+
+@app.get('/api/leocem/test-case-report/{kind}')
+def leocem_case_report(kind: str):
+    """Planned Leocem test case steps, not actual script-run results."""
+    from backend import leocem_test_case_report as tcr
+    try:
+        plan = tcr.definition()
+        if kind == 'json':
+            return plan
+        if kind == 'xlsx':
+            return Response(tcr.excel(plan),
+                            media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                            headers={'Content-Disposition': 'attachment; filename="Leocem_Test_Case_Report_Steps.xlsx"'})
+        if kind == 'html':
+            return Response(tcr.html_report(plan), media_type='text/html',
+                            headers={'Content-Disposition': 'inline; filename="Leocem_Test_Case_Report.html"'})
+        raise ValueError('Supported Test Case Report formats: json, xlsx, html')
+    except Exception as err: fail(err)
+
+
+@app.get('/api/script-workspace/runs/{run_id}/export/{kind}')
+def script_report(run_id: str, kind: str, view: bool = False):
+    try:
+        detail = script_manager.detail(run_id)
+        if kind == 'xlsx':
+            return Response(sw.report_excel(detail), media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                            headers={'Content-Disposition': f'attachment; filename="Leocem_Test_Execution_{run_id[:8]}.xlsx"'})
+        if kind == 'html':
+            return Response(sw.report_html(detail), media_type='text/html',
+                            headers={'Content-Disposition': f'{"inline" if view else "attachment"}; filename="Leocem_Test_Execution_{run_id[:8]}.html"'})
+        if kind == 'json':
+            return JSONResponse(detail, headers={'Content-Disposition': f'attachment; filename="Leocem_Test_Execution_{run_id[:8]}.json"'})
+        raise ValueError('Supported report formats: xlsx, html, json')
+    except Exception as err: fail(err)
+
+@app.get('/api/script-workspace/runs/{run_id}/evidence/{file_path:path}')
+def script_evidence(run_id: str, file_path: str, preview: bool = False):
+    try:
+        root = sw.run_path(run_id).resolve()
+        path = (root / file_path).resolve()
+        if not path.is_relative_to(root) or not path.is_file() or path.suffix.lower() not in ('.png', '.pdf', '.zip'):
+            raise ValueError('Evidence file not found')
+        inline = preview and path.suffix.lower() in ('.png', '.pdf')
+        return FileResponse(path, filename=path.name,
+                            content_disposition_type='inline' if inline else 'attachment')
+    except Exception as err: fail(err)
+
+class ScriptAnalyzeInput(BaseModel):
+    script_id: str
+    project_id: str
+    reviewed_sha256: str
+
+@app.post('/api/script-workspace/analyze')
+def script_analyze(body: ScriptAnalyzeInput):
+    try:
+        info, raw = sw.inspect_source(body.script_id)
+        if info['sha256'] != body.reviewed_sha256:
+            raise ValueError('Script changed. Refresh the saved revision first.')
+        return suite.save_script(body.project_id, info['filename'], info['module'], info['process'], raw)
+    except Exception as err: fail(err)
+
+@app.get('/api/automation-dashboard')
+def automation_dashboard(project_id: str = '', leocem_only: bool = False):
+    where, args = (' WHERE project_id=?', (project_id,)) if project_id else ('', ())
+    with connect() as db:
+        grouped = {r['status']: r['n'] for r in db.execute('SELECT status,COUNT(*) AS n FROM module_cases' + where + ' GROUP BY status', args)}
+        approved = db.execute('SELECT COUNT(*) FROM module_cases' + (where + ' AND approved=1' if where else ' WHERE approved=1'), args).fetchone()[0]
+        recent = [dict(row) for row in db.execute('SELECT * FROM module_results' + where + ' ORDER BY id DESC LIMIT 8', args)]
+    history = script_manager.history('' if leocem_only else project_id)
+    if leocem_only:
+        # Fixed Leocem script may have run under an older registered test project ID.
+        history = [run for run in history if run.get('script_id') in ('procurement/pi_lpo_grn.py','procurement/v636_case_runner.py','procurement/v636_pi_po_negative.py')]
+    latest = script_manager.detail(history[0]['id']) if history else None
+    script_checks = latest['checks'] if latest else []
+    script_counts = latest['run']['counts'] if latest else {'passed': 0, 'failed': 0, 'review': 0, 'blocked': 0}
+    return {'cases': {'total': sum(grouped.values()), 'passed': grouped.get('PASSED', 0),
+                      'failed': grouped.get('FAILED', 0), 'blocked': grouped.get('BLOCKED', 0),
+                      'not_run': grouped.get('NOT RUN', 0), 'approved': approved},
+            'recent_cases': recent, 'script_runs': history[:6], 'script_run_count': len(history), 'latest_script': latest,
+            'latest_script_checks': {'total': len(script_checks), **script_counts},
+            'recent_script_checks': script_checks[-10:][::-1],
+            'active_id': script_manager.active_id}
+
+
+
+@app.get('/api/leocem/dashboard/summary')
+def leocem_dashboard_summary(period: str = 'day', date: str = ''):
+    """Read-only actual Leocem script checks, in IST day/week/month windows."""
+    from backend.leocem_analytics import summary
+    try:
+        return summary(script_manager, period, date or None)
+    except ValueError as err:
+        fail(err)
+
+# v6.3.1 - one-script Leocem quick run (no ERP picker, no arbitrary uploads).
+from backend import leocem_quickrun as leocem
+
+class LeocemLaunch(BaseModel):
+    reviewed_sha256: str = Field(pattern=r'^[a-f0-9]{64}$')
+    acknowledge_test_transactions: bool = False
+    acknowledge_trusted_code: bool = False
+    positive_scenarios: bool = True
+    negative_scenarios: bool = False
+
+@app.get('/api/leocem/ready')
+def leocem_ready():
+    return leocem.readiness()
+
+@app.post('/api/leocem/run')
+def leocem_run(body: LeocemLaunch):
+    try:
+        if body.positive_scenarios == body.negative_scenarios:
+            raise ValueError('Choose exactly one scenario: Positive OR Negative.')
+        if not body.acknowledge_test_transactions or not body.acknowledge_trusted_code:
+            raise ValueError('Confirm the source code and authorized TEST/STAGING transactions before running.')
+        status = leocem.readiness()
+        if not status['ready']:
+            raise ValueError('Leocem is not ready: ' + ' '.join(status['issues']))
+        if status['script']['sha256'] != body.reviewed_sha256:
+            raise ValueError('Your VS Code file changed. Review the newly saved revision before running.')
+        project = leocem.ensure_project(status)
+        run_input = sw.ScriptRunInput(project_id=project['id'], script_id=leocem.SCRIPT_ID,
+            reviewed_sha256=body.reviewed_sha256, mode='new', trust_local_code=True,
+            allow_test_transactions=True, initial_role_confirmed=False,
+            positive_scenarios=body.positive_scenarios, negative_scenarios=body.negative_scenarios)
+        return script_manager.start(run_input, controller)
+    except Exception as err:
+        fail(err)
+
+# SMART_ERP_V636_DIRECT_EXCEL_MANUAL_CASES
+from backend import v636_cases as _v636_cases
+_v636_cases.install(app, script_manager, controller)
+
+# SMART_ERP_V636_NEGATIVE_PI_PO_EXCLUSIVE
+
+# SMART_ERP_V636_KEEP_TOGGLES_NEGATIVE_LOGIN_TO_LPO_V2
+
+# SMART_ERP_OPTIONAL_AI_LAB_V636_20261029
+from backend import optional_ai_lab as _optional_ai_lab
+_optional_ai_lab.configure(controller, script_manager)
+app.include_router(_optional_ai_lab.router)

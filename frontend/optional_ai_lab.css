@@ -1,0 +1,23 @@
+/* Optional Smart ERP AI Test Lab. Scopes all styling to lab-* to preserve existing dashboard. */
+.lab-columns{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:20px;align-items:start;margin-top:18px}
+.lab-panel{padding:22px}
+.lab-label{display:flex;flex-direction:column;gap:7px;font-size:13px;font-weight:650;color:#193a5b;margin:13px 0}
+.lab-input{box-sizing:border-box;display:block;width:100%;font:inherit;padding:10px 12px;border:1px solid #bccddd;border-radius:9px;color:#132f50;background:#fff;min-height:42px}
+textarea.lab-input{resize:vertical;line-height:1.5}
+.lab-chip{display:inline-block;padding:5px 9px;border:1px solid #afc6d8;border-radius:50px;color:#2c567a;font-size:11px;font-weight:600}
+.lab-result{border:1px solid #cedbe8;border-radius:12px;background:#f6f9fd;padding:14px;margin-top:15px;overflow:auto}
+.lab-result h4{margin:8px 0}
+.lab-result p{line-height:1.4;overflow-wrap:anywhere}
+.lab-result ul{font-size:13px;padding-left:20px;line-height:1.7;overflow-wrap:anywhere}
+.lab-alert{background:#fff5e8;border:1px solid #edbb76;border-radius:10px;padding:12px;color:#61421c}
+.lab-code{font-family:Consolas,monospace;font-size:12px}
+.lab-code-display{max-height:460px;overflow:auto;white-space:pre;line-height:1.45;font-size:11px;background:#102745;color:#edf5fa;padding:13px;border-radius:8px}
+.lab-approval{display:flex;align-items:flex-start;gap:8px;font-size:13px;margin:14px 0;line-height:1.5}
+.lab-approval input{margin-top:3px}
+.lab-action-row{display:flex;gap:10px;flex-wrap:wrap;margin:16px 0}
+.lab-counts{display:flex;gap:14px;flex-wrap:wrap;font-weight:600;font-size:13px;color:#193a5b}
+@media(max-width:1050px){.lab-columns{grid-template-columns:1fr}}
+
+.lab-targets{display:flex;flex-direction:column;max-height:250px;overflow:auto;gap:7px;margin-top:10px}
+.lab-targets>div{display:flex;flex-direction:column;border-bottom:1px solid #dce6f0;padding:5px 0;font-size:12px;overflow-wrap:anywhere}
+.lab-targets code{font-size:11px;color:#134d75}

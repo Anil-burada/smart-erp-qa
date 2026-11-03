@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "project_id": "erp_two",
+  "name": "indent_to_grn",
+  "description": "ILLUSTRATIVE second ERP: two requisition approvals and one PO approval; configure and record actual business rules.",
+  "logout_workflow": "logout",
+  "stages": [
+    {"name":"Create requisition","phase":"create","workflow":"create_req","account":"requestor","require_assertion":true},
+    {"name":"Manager approves requisition","phase":"approval","workflow":"approve_req_manager","account":"manager","require_assertion":true},
+    {"name":"GM approves requisition","phase":"approval","workflow":"approve_req_gm","account":"gm","require_assertion":true},
+    {"name":"Create PO","phase":"create","workflow":"create_po","account":"buyer","require_assertion":true},
+    {"name":"Approve PO","phase":"approval","workflow":"approve_po","account":"gm","require_assertion":true},
+    {"name":"Receive GRN","phase":"grn","workflow":"create_grn","account":"warehouse","require_assertion":true}
+  ]
+}

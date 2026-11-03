@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "project_id": "kagami_ba",
+  "name": "indent_to_grn",
+  "description": "Example project plan translated from user's full Kagami PI -> LPO -> GRN script; record/review every named workflow before live use.",
+  "logout_workflow": "logout",
+  "stages": [
+    {"name":"Create and submit Purchase Indent","phase":"create","workflow":"pi_create_submit","account":"creator","require_assertion":true},
+    {"name":"Indent approval 1 (creator)","phase":"approval","workflow":"pi_approval_creator","account":"creator","require_assertion":true},
+    {"name":"Indent approval 2","phase":"approval","workflow":"pi_approval_manager","account":"manager","require_assertion":true},
+    {"name":"Indent approval 3","phase":"approval","workflow":"pi_approval_final","account":"indent_final","require_assertion":true},
+    {"name":"Create LPO for captured PI","phase":"create","workflow":"lpo_create","account":"manager","require_assertion":true},
+    {"name":"Submit new LPO","phase":"submit","workflow":"lpo_submit","account":"manager","require_assertion":true},
+    {"name":"LPO approval 1","phase":"approval","workflow":"lpo_approval_manager","account":"manager","require_assertion":true},
+    {"name":"LPO approval 2","phase":"approval","workflow":"lpo_approval_creator","account":"creator","require_assertion":true},
+    {"name":"LPO approval 3","phase":"approval","workflow":"lpo_approval_final","account":"indent_final","require_assertion":true},
+    {"name":"LPO approval 4","phase":"approval","workflow":"lpo_approval_last","account":"po_final","require_assertion":true},
+    {"name":"Create GRN from captured approved LPO","phase":"grn","workflow":"grn_create","account":"manager","require_assertion":true},
+    {"name":"Submit exact captured GRN","phase":"submit","workflow":"grn_submit","account":"manager","require_assertion":true}
+  ]
+}
